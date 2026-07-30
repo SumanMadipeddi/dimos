@@ -32,9 +32,17 @@ import uvicorn
 from dimos.agents.annotation import skill
 from dimos.agents.capabilities import CapabilityRegistry
 from dimos.agents.mcp import tool_stream
+from dimos.agents.trace.types import (
+    EventSource,
+    EventType,
+    MissionContext,
+    MissionEvent,
+    Status,
+)
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.rpc_client import RpcCall, RPCClient
+from dimos.core.stream import Out
 from dimos.core.transport_factory import make_transport
 from dimos.utils.logging_config import setup_logger
 
@@ -66,6 +74,40 @@ app.state.sse_queues = []
 app.state.event_loop = None
 app.state.cap_registry = CapabilityRegistry()
 app.state.cap_acquire_timeout = DEFAULT_CAP_ACQUIRE_TIMEOUT
+# Mission-trace sink: a callable set by `McpServer.start` to publish server-side
+# `MissionEvent`s. `None` (the default) makes all trace emission a no-op, so the
+# server behaves exactly as before for callers that don't wire tracing.
+app.state.trace_sink = None
+app.state.trace_run_id = ""
+# progressToken -> (MissionContext, tool_name) for correlating background
+# (tool-stream) frames back to the invocation that started them.
+app.state.trace_invocations = {}
+
+
+def _emit_trace(event: MissionEvent) -> None:
+    """Publish a server-side mission event through the installed sink, if any."""
+    sink = app.state.trace_sink
+    if sink is None:
+        return
+    try:
+        sink(event)
+    except Exception:
+        logger.exception("mission-trace sink failed", event_type=event.event_type)
+
+
+def _context_from_meta(meta: dict[str, Any]) -> MissionContext:
+    """Reconstruct the mission correlation context from a request's ``_meta``.
+
+    Falls back to the server's run id and an ``"unknown"`` mission when a caller
+    doesn't propagate the DimOS correlation keys (e.g. Claude Code / curl).
+    """
+    run_id = meta.get("runId") or app.state.trace_run_id or MissionContext.for_mission("").run_id
+    return MissionContext(
+        run_id=str(run_id),
+        mission_id=str(meta.get("missionId") or "unknown"),
+        turn_id=meta.get("turnId"),
+        invocation_id=meta.get("progressToken"),
+    )
 
 
 def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
@@ -118,10 +160,24 @@ async def _handle_tools_call(
     args: dict[str, Any] = params.get("arguments") or {}
     meta = params.get("_meta") or {}
     progress_token = meta.get("progressToken")
+    ctx = _context_from_meta(meta)
 
     rpc_call = rpc_calls.get(name)
     if rpc_call is None:
         logger.warning("MCP tool not found", tool=name)
+        # A selected tool that doesn't exist is a tool-selection failure, not a
+        # skill-execution failure — surface it as such for attribution.
+        _emit_trace(
+            MissionEvent.create(
+                EventType.TOOL_FAILED,
+                EventSource.SERVER,
+                ctx,
+                tool_name=name,
+                status=Status.FAILURE,
+                error_code="TOOL_NOT_FOUND",
+                summary=f"Tool not found: {name}",
+            )
+        )
         return _jsonrpc_result_text(req_id, f"Tool not found: {name}")
 
     skill_info = app.state.skills_by_name.get(name)
@@ -170,12 +226,40 @@ async def _handle_tools_call(
                 advice = "Call the appropriate stop tool first, then retry."
             else:
                 advice = "It is taking longer than expected; wait a moment and then retry."
+            _emit_trace(
+                MissionEvent.create(
+                    EventType.TOOL_REFUSED,
+                    EventSource.SERVER,
+                    ctx,
+                    tool_name=name,
+                    status=Status.REFUSED,
+                    error_code="CAPABILITY_BUSY",
+                    summary=f"capability '{cap}' held by '{holder}'",
+                    attributes={"capability": cap, "holder": holder},
+                )
+            )
             return _jsonrpc_result_text(
                 req_id,
                 f"Cannot start '{name}': capability '{cap}' is held by '{holder}'. {advice}",
             )
 
     logger.info("MCP tool call", tool=name, args=args, progress_token=progress_token)
+
+    # The server is authoritative for actual execution state. Record the start
+    # (and remember the context so background tool-stream frames from a
+    # long-running skill can be correlated back to this invocation).
+    if progress_token is not None:
+        app.state.trace_invocations[progress_token] = (ctx, name)
+    _emit_trace(
+        MissionEvent.create(
+            EventType.TOOL_STARTED,
+            EventSource.SERVER,
+            ctx,
+            tool_name=name,
+            status=Status.STARTED,
+            attributes={"args": args, "lifecycle": lifecycle},
+        )
+    )
     t0 = time.monotonic()
 
     # _mcp_context is a reserved kwarg consumed by the `@skill` wrapper; it never
@@ -200,7 +284,23 @@ async def _handle_tools_call(
                 None, lambda: rpc_call(**call_kwargs)
             )
         except Exception as e:
-            logger.exception("MCP tool error", tool=name, duration=f"{time.monotonic() - t0:.3f}s")
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            logger.exception("MCP tool error", tool=name, duration=f"{elapsed_ms / 1000:.3f}s")
+            _emit_trace(
+                MissionEvent.create(
+                    EventType.TOOL_FAILED,
+                    EventSource.SERVER,
+                    ctx,
+                    tool_name=name,
+                    status=Status.FAILURE,
+                    duration_ms=elapsed_ms,
+                    error_code="EXCEPTION",
+                    summary=f"{type(e).__name__}: {e}",
+                    attributes={"exception_type": type(e).__name__},
+                )
+            )
+            if progress_token is not None:
+                app.state.trace_invocations.pop(progress_token, None)
             return _jsonrpc_result_text(req_id, f"Error running tool '{name}': {e}")
 
         if lifecycle == "background":
@@ -210,8 +310,16 @@ async def _handle_tools_call(
         if caps_held:
             cap_registry.release_by_token(acquire_token)
 
-    duration = f"{time.monotonic() - t0:.3f}s"
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+    duration = f"{elapsed_ms / 1000:.3f}s"
     response = str(result)[:200]
+    _emit_tool_result(ctx, name, result, elapsed_ms)
+
+    # A completed instant invocation won't produce a tool-stream stop frame, so
+    # release its correlation entry now; background invocations keep theirs
+    # until their stop frame arrives.
+    if progress_token is not None and lifecycle != "background":
+        app.state.trace_invocations.pop(progress_token, None)
 
     if hasattr(result, "agent_encode"):
         logger.info("MCP tool done", tool=name, duration=duration, response=response)
@@ -219,6 +327,47 @@ async def _handle_tools_call(
 
     logger.info("MCP tool done", tool=name, duration=duration, response=response)
     return _jsonrpc_result_text(req_id, str(result))
+
+
+def _emit_tool_result(ctx: MissionContext, name: str, result: Any, elapsed_ms: float) -> None:
+    """Emit ``tool_completed`` or ``tool_failed`` based on the RPC return value.
+
+    A structured ``SkillResult`` is authoritative: ``success=False`` becomes a
+    ``tool_failed`` carrying the skill's ``error_code``. Any other return value
+    means the RPC returned without raising, recorded as ``tool_completed``.
+    Completion reflects that the *call returned*, not that the physical task was
+    verified (see the trace spec's Layer E).
+    """
+    if app.state.trace_sink is None:
+        return
+    from dimos.agents.skill_result import SkillResult
+
+    if isinstance(result, SkillResult) and not result.success:
+        _emit_trace(
+            MissionEvent.create(
+                EventType.TOOL_FAILED,
+                EventSource.SERVER,
+                ctx,
+                tool_name=name,
+                status=Status.FAILURE,
+                duration_ms=elapsed_ms,
+                error_code=result.error_code,
+                summary=result.message or None,
+            )
+        )
+        return
+
+    _emit_trace(
+        MissionEvent.create(
+            EventType.TOOL_COMPLETED,
+            EventSource.SERVER,
+            ctx,
+            tool_name=name,
+            status=Status.SUCCESS,
+            duration_ms=elapsed_ms,
+            summary=str(result)[:200],
+        )
+    )
 
 
 async def handle_request(
@@ -267,6 +416,62 @@ async def mcp_endpoint(request: Request) -> Response:
     return JSONResponse(result)
 
 
+def _emit_background_trace(msg: dict[str, Any]) -> None:
+    """Emit ``tool_progress`` / ``tool_stopped`` for background tool-stream frames.
+
+    A background skill's initial ``tools/call`` returns immediately while its
+    physical work continues, so these frames prove that *RPC completion !=
+    physical-operation completion*. Progress frames carry the originating
+    ``progressToken`` and are correlated back to the invocation's mission/turn;
+    stop frames carry only the tool name (and an acquire token), so they are
+    correlated best-effort by tool name.
+    """
+    if app.state.trace_sink is None:
+        return
+    method = msg.get("method")
+    params = msg.get("params") or {}
+
+    if method == tool_stream.NOTIFICATIONS_PROGRESS_METHOD:
+        token = params.get("progressToken")
+        entry = app.state.trace_invocations.get(token)
+        if entry is None:
+            return  # uncorrelated progress (no recorded start) — skip
+        ctx, tool_name = entry
+        _emit_trace(
+            MissionEvent.create(
+                EventType.TOOL_PROGRESS,
+                EventSource.TOOL_STREAM,
+                ctx,
+                tool_name=tool_name,
+                summary=str(params.get("message") or ""),
+            )
+        )
+    elif method == tool_stream.TOOL_STREAM_STOPPED_METHOD:
+        tool_name = params.get("tool_name")
+        entry = next(
+            (
+                (tok, val)
+                for tok, val in list(app.state.trace_invocations.items())
+                if val[1] == tool_name
+            ),
+            None,
+        )
+        if entry is None:
+            return
+        token, (ctx, _) = entry
+        app.state.trace_invocations.pop(token, None)
+        _emit_trace(
+            MissionEvent.create(
+                EventType.TOOL_STOPPED,
+                EventSource.TOOL_STREAM,
+                ctx,
+                tool_name=tool_name,
+                status=Status.UNVERIFIED,
+                summary="background tool stopped",
+            )
+        )
+
+
 def _sse_frame(data: dict[str, Any]) -> str:
     """Format a JSON-RPC message as an SSE ``event: message`` frame."""
     return f"event: message\ndata: {json.dumps(data)}\n\n"
@@ -278,6 +483,7 @@ def _fan_out_to_sse_queues(msg: dict[str, Any]) -> None:
     Also releases capabilities held by a background skill when its tool-stream
     closes (signaled by a ``dimos/tool_stopped`` frame).
     """
+    _emit_background_trace(msg)
     if msg.get("method") == tool_stream.TOOL_STREAM_STOPPED_METHOD:
         params = msg.get("params") or {}
         token = params.get("token")
@@ -345,6 +551,11 @@ async def mcp_sse_endpoint() -> StreamingResponse:
 
 
 class McpServer(Module):
+    # Server-authoritative mission-trace channel (tool started/refused/
+    # completed/failed and background progress/stopped). Wired non-invasively:
+    # the sink is installed on start and removed on stop.
+    mission_trace: Out[MissionEvent]
+
     _uvicorn_server: uvicorn.Server | None = None
     _serve_future: concurrent.futures.Future[None] | None = None
     _tool_stream_cleanup: Callable[[], None] | None = None
@@ -353,10 +564,17 @@ class McpServer(Module):
     def start(self) -> None:
         super().start()
         self._start_server()
+        app.state.trace_run_id = MissionContext.for_mission("").run_id
+        app.state.trace_invocations = {}
+        app.state.trace_sink = self._publish_trace_event
         self._tool_stream_cleanup = tool_stream.subscribe(_fan_out_to_sse_queues)
+
+    def _publish_trace_event(self, event: MissionEvent) -> None:
+        self.mission_trace.publish(event)
 
     @rpc
     def stop(self) -> None:
+        app.state.trace_sink = None
         if self._tool_stream_cleanup is not None:
             self._tool_stream_cleanup()
             self._tool_stream_cleanup = None

@@ -90,3 +90,4 @@ yolo11n*.pt
 # Generic ignore patterns
 *.ignore
 *.ignore.*
+notes.md

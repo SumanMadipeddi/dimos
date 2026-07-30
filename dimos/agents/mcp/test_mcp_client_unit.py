@@ -24,7 +24,7 @@ from langchain_openai import ChatOpenAI
 import pytest
 import requests
 
-from dimos.agents.mcp.mcp_client import McpClient
+from dimos.agents.mcp.mcp_client import McpClient, MessageSource
 
 
 def _mock_payload(body: dict[str, object]) -> dict[str, object]:
@@ -157,7 +157,9 @@ def test_tool_stream_notification_becomes_human_message(mcp_client: McpClient) -
     }
     mcp_client._on_tool_stream_message(notification)
 
-    msg: BaseMessage = mcp_client._message_queue.get_nowait()
+    queued = mcp_client._message_queue.get_nowait()
+    assert queued.source is MessageSource.TOOL_PROGRESS
+    msg: BaseMessage = queued.message
     assert isinstance(msg, HumanMessage)
     assert "[tool:follow_person]" in str(msg.content)
     assert "Person follow stopped: lost track." in str(msg.content)
@@ -193,7 +195,9 @@ def test_tool_stream_progress_frame_becomes_human_message(mcp_client: McpClient)
     }
     mcp_client._on_tool_stream_message(progress_frame)
 
-    msg: BaseMessage = mcp_client._message_queue.get_nowait()
+    queued = mcp_client._message_queue.get_nowait()
+    assert queued.source is MessageSource.TOOL_PROGRESS
+    msg: BaseMessage = queued.message
     assert isinstance(msg, HumanMessage)
     assert str(msg.content) == "[tool:follow_person] Found a person"
 
